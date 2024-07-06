@@ -8,7 +8,8 @@ use pleco::tools::PreFetchable;
 use pleco::MoveList;
 use pleco::{board, core::*};
 use pleco::{BitMove, Board, SQ};
-use std::cell::{RefCell, UnsafeCell};
+use std::borrow::Borrow;
+use std::cell::{Ref, RefCell, UnsafeCell};
 use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::fmt::{Debug, Error, Formatter};
@@ -16,6 +17,7 @@ use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread::current;
 use std::{default, mem};
 
 use consts::*;
@@ -35,11 +37,11 @@ use time::uci_timer::*;
 
 struct MctsSearcher {
     // search data
-    pub board: Board,
-    pub nodes: AtomicU64,
-    pub root_node: RefCell<Node>,
-    pub side_played: Player,
-    // pub nof_iterations: usize,
+    board: Board,
+    nodes: AtomicU64,
+    root_node: Rc<RefCell<Node>>,
+    side_played: Player,
+    // nof_iterations: usize,
 }
 
 impl MctsSearcher {
@@ -47,7 +49,7 @@ impl MctsSearcher {
         MctsSearcher {
             board: Board::start_pos(),
             nodes: AtomicU64::new(0),
-            root_node: RefCell::new(Node::new_root()),
+            root_node: Rc::new(RefCell::new(Node::new_root())),
             side_played: side_played,
         }
     }
@@ -56,33 +58,57 @@ impl MctsSearcher {
         //always start at root node.
         let transposition_table = TranspositionTable::new_num_entries(40000);
         self.root_node.borrow_mut().increment_visits();
-        if !self.root_node.borrow().edges_created {
+        let current_node = self.root_node.clone();
+        if !current_node.as_ref().borrow().edges_created {
             self.root_node.borrow_mut().create_edges(Weak::new());
-            // root_node.children = RefCell::new(vec![root_node.edges.borrow().len()]);
         }
-
         //Selection
         let uct = &UCT::new(2f32.sqrt());
         let mut biggest_ucb: f32 = 0.0;
         let mut selected_edge_index: usize = 0;
-        (biggest_ucb, selected_edge_index) = self.root_node.borrow().select_child_uct(&uct);
-        self.root_node
-            .borrow_mut()
-            .solidify_child(selected_edge_index);
-        self.root_node
+        let mut current_node = self.root_node.clone();
+        while !current_node.as_ref().borrow().is_leaf() {
+            (biggest_ucb, selected_edge_index) =
+                current_node.as_ref().borrow().select_child_uct(&uct);
+            if current_node
+                .as_ref()
+                .borrow()
+                .child_corresponding_to_edge_exists(selected_edge_index)
+            {
+                let child_index = current_node
+                    .as_ref()
+                    .borrow()
+                    .get_child_index_from_edge_index(selected_edge_index);
+                let c = current_node.as_ref().borrow().get_child(child_index);
+                current_node = c;
+                continue;
+            }
+        }
+
+        let new_child_index = current_node
+            .as_ref()
             .borrow_mut()
             .push_new_child(selected_edge_index);
-        let reward = self
-            .root_node
+
+        let c = current_node
+            .as_ref()
+            .borrow()
+            .children
+            .borrow()
+            .last()
+            .unwrap()
+            .clone();
+        current_node = c;
+        dbg!(self.root_node.as_ref().borrow());
+        let reward = current_node
             .borrow_mut()
             .simulate(selected_edge_index, &self.side_played);
 
         //otherwise recurse
-        dbg!(self.root_node.borrow());
     }
 
     fn set_edge_to_solid(&self, selected_edge_index: usize) {
-        self.root_node.borrow().edges.borrow_mut()[selected_edge_index]
+        self.root_node.as_ref().borrow().edges.borrow_mut()[selected_edge_index]
             .borrow_mut()
             .solid_child = true;
     }
@@ -111,7 +137,7 @@ impl UCT {
 
 struct Thompson {}
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 #[repr(u8)]
 enum TerminalType {
     NONTERMINAL = 0,
@@ -119,7 +145,7 @@ enum TerminalType {
     LEAF = 2,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Node {
     pub state: Board,
     pub visits: u16,
@@ -129,7 +155,7 @@ struct Node {
     pub terminal_type: TerminalType,
     pub edges: RefCell<Vec<Rc<RefCell<Edge>>>>,
     pub edges_created: bool,
-    // pub edge_index: usize,
+    // edge_index: usize,
     pub children: RefCell<Vec<Rc<RefCell<Node>>>>,
     pub parent: RefCell<Weak<Node>>,
 }
@@ -167,12 +193,6 @@ impl Node {
         }
     }
 
-//    fn new_child(self) {
-//         let mut new_child = Node::new(false);
-//         *new_child.parent.borrow_mut() = Rc::downgrade(&Rc::new(self));
-//         self.children.borrow_mut().push(new_child);
-//    }
-
     fn create_edges(&mut self, parent: Weak<Node>) {
         let movelist = self.state.generate_moves();
         let edges = Edge::from_move_list(movelist, parent);
@@ -192,30 +212,58 @@ impl Node {
         self.children = RefCell::new(Vec::with_capacity(n));
     }
 
-    fn solidify_child(&mut self, selected_index: usize) {
-        let new_node = Node::new(false);
-        self.children
-            .borrow_mut()
-            .push(Rc::new(RefCell::new(new_node)));
-        self.edges.borrow_mut()[selected_index]
-            .borrow_mut()
-            .child_index = self.children.borrow().len();
+    fn child_corresponding_to_edge_exists(&self, selected_edge_index: usize) -> bool {
+        return self.edges.borrow()[selected_edge_index]
+            .as_ref()
+            .borrow()
+            .solid_child;
     }
 
-    fn push_new_child(&mut self, selected_index: usize) {
+    fn get_child(&self, child_index: usize) -> Rc<RefCell<Node>> {
+        Rc::clone(self.borrow().children.borrow().get(child_index).unwrap())
+    }
+
+    fn get_child_index_from_edge_index(&self, selected_edge_index: usize) -> usize {
+        let child_index = self
+            .edges
+            .borrow()
+            .get(selected_edge_index)
+            .unwrap()
+            .as_ref()
+            .borrow()
+            .child_index;
+        child_index
+    }
+    fn push_new_child(&mut self, selected_index: usize) -> usize {
+        let mv = self
+            .edges
+            .borrow()
+            .get(selected_index)
+            .unwrap()
+            .as_ref()
+            .borrow()
+            ._move;
         self.children
             .borrow_mut()
             .push(Rc::new(RefCell::new(Node::new(false))));
-        self.children.borrow_mut()[0]
+        self.children
+            .borrow_mut()
+            .last()
+            .unwrap()
             .borrow_mut()
             .state
-            .apply_move(self.edges.borrow()[selected_index].borrow()._move);
+            .apply_move(mv);
+        self.terminal_type = TerminalType::NONTERMINAL;
+        let s = self.children.borrow().len() - 1;
+        println!("{}", &s);
+        return s;
     }
 
     fn simulate(&mut self, child_index: usize, side_played: &Player) -> f32 {
         //simulation
         let kids = self.children.borrow_mut();
-        let board_pos = &mut kids[child_index].borrow_mut().state;
+        // let board_pos = &mut kids.get(child_index).unwrap().borrow_mut().state;
+        let board_pos = &mut self.state;
         let mut prng = rand::thread_rng();
         let mut simulation_depth = 0;
         let mut result: f32 = 0.0;
@@ -257,7 +305,7 @@ impl Node {
         let mut selected_edge_index = 0;
         if self.is_leaf() {
             for (i, edge) in self.edges.borrow().iter().enumerate() {
-                let edge = edge.borrow();
+                let edge = edge.as_ref().borrow();
                 if !edge.solid_child {
                     let qsa = 0.0;
                     let nsa = self.visits;
@@ -268,9 +316,8 @@ impl Node {
                         biggest_ucb = uct_for_node;
                     }
                 } else {
-                    let c = &self.children.borrow()[i];
-                    let child = c.borrow();
-                    // Use the `child` variable instead of the borrowed value directly
+                    let c = self.children.borrow();
+                    let child = c[i].as_ref().borrow();
                     let ns = self.visits;
                     let nsa = edge.passes;
                     let qsa: f32 = (child.wins / nsa as f32) as f32;
