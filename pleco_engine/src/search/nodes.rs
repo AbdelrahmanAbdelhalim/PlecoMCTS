@@ -12,6 +12,7 @@ use std::borrow::Borrow;
 use std::cell::{Ref, RefCell, UnsafeCell};
 use std::cmp::{max, min};
 use std::collections::HashMap;
+use std::fmt;
 use std::fmt::{Debug, Error, Formatter};
 use std::ops::{Deref, DerefMut};
 use std::ptr;
@@ -41,6 +42,7 @@ struct MctsSearcher {
     nodes: AtomicU64,
     root_node: Rc<RefCell<Node>>,
     side_played: Player,
+    all_nodes_visit_counts: i32,
     // nof_iterations: usize,
 }
 
@@ -51,60 +53,70 @@ impl MctsSearcher {
             nodes: AtomicU64::new(0),
             root_node: Rc::new(RefCell::new(Node::new_root())),
             side_played: side_played,
+            all_nodes_visit_counts: 0,
         }
     }
 
     fn search(&mut self) {
         //always start at root node.
-        let transposition_table = TranspositionTable::new_num_entries(40000);
+        let _transposition_table = TranspositionTable::new_num_entries(40000);
         self.root_node.borrow_mut().increment_visits();
-        let current_node = self.root_node.clone();
-        if !current_node.as_ref().borrow().edges_created {
-            self.root_node.borrow_mut().create_edges(Weak::new());
-        }
-        //Selection
         let uct = &UCT::new(2f32.sqrt());
-        let mut biggest_ucb: f32 = 0.0;
-        let mut selected_edge_index: usize = 0;
-        let mut current_node = self.root_node.clone();
-        while !current_node.as_ref().borrow().is_leaf() {
-            (biggest_ucb, selected_edge_index) =
-                current_node.as_ref().borrow().select_child_uct(&uct);
-            if current_node
-                .as_ref()
-                .borrow()
-                .child_corresponding_to_edge_exists(selected_edge_index)
-            {
-                let child_index = current_node
+        let uct = &UCT::new(8.0);
+        
+        for i in 0..20 {
+            println!("{}", i);
+            let mut current_node = self.root_node.clone();
+            let mut _biggest_ucb: f32 = 0.0;
+            let mut selected_edge_index: usize = 0;
+            let mut stack: Vec<Rc<RefCell<Node>>> = vec![];
+            while !current_node.as_ref().borrow().is_leaf() {
+                stack.push(Rc::clone(&current_node));
+                if !current_node.as_ref().borrow().edges_created {
+                    current_node.as_ref().borrow_mut().create_edges(Weak::new());
+                }
+                (_biggest_ucb, selected_edge_index) =
+                    current_node.as_ref().borrow_mut().select_child_uct(&uct);
+                if current_node
                     .as_ref()
                     .borrow()
-                    .get_child_index_from_edge_index(selected_edge_index);
-                let c = current_node.as_ref().borrow().get_child(child_index);
-                current_node = c;
-                continue;
+                    .child_corresponding_to_edge_exists(selected_edge_index)
+                {
+                    let child_index = current_node
+                        .as_ref()
+                        .borrow()
+                        .get_child_index_from_edge_index(selected_edge_index);
+                    let c = current_node.as_ref().borrow().get_child(child_index);
+                    current_node = c;
+                    continue;
+                } else {
+                    break;
+                }
+            }
+            if !current_node.as_ref().borrow().edges_created {
+                current_node.as_ref().borrow_mut().create_edges(Weak::new());
+            }
+            current_node
+                .as_ref()
+                .borrow_mut()
+                .push_new_child(selected_edge_index);
+
+            let c = current_node
+                .as_ref()
+                .borrow()
+                .children
+                .borrow()
+                .last()
+                .unwrap()
+                .clone();
+            current_node = c;
+            let reward = current_node.borrow_mut().simulate(&self.side_played);
+
+            for node in stack.into_iter() {
+                node.as_ref().borrow_mut().wins += reward;
             }
         }
 
-        let new_child_index = current_node
-            .as_ref()
-            .borrow_mut()
-            .push_new_child(selected_edge_index);
-
-        let c = current_node
-            .as_ref()
-            .borrow()
-            .children
-            .borrow()
-            .last()
-            .unwrap()
-            .clone();
-        current_node = c;
-        dbg!(self.root_node.as_ref().borrow());
-        let reward = current_node
-            .borrow_mut()
-            .simulate(selected_edge_index, &self.side_played);
-
-        //otherwise recurse
     }
 
     fn set_edge_to_solid(&self, selected_edge_index: usize) {
@@ -131,7 +143,9 @@ impl UCT {
         }
     }
     fn calc_uct_for_node(&self, qsa: f32, ns: u16, nsa: u16) -> f32 {
-        qsa + (self.uct_constant * (f32::ln(ns as f32) / (1.0 + nsa as f32)))
+        let uct = qsa + (self.uct_constant * (f32::ln(ns as f32) / (1.0 + nsa as f32)));
+        println!("{}", &uct);
+        return uct;
     }
 }
 
@@ -145,7 +159,7 @@ enum TerminalType {
     LEAF = 2,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct Node {
     pub state: Board,
     pub visits: u16,
@@ -160,15 +174,26 @@ struct Node {
     pub parent: RefCell<Weak<Node>>,
 }
 
+impl fmt::Debug for Node {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Node")
+            // .field("state", &self.state)
+            // .field("children", &self.children)
+            // .field("turn", &self.state.turn())
+            .field("wins", &self.wins)
+            .finish()
+    }
+}
+
 impl Node {
-    fn new(as_root: bool) -> Self {
+    fn new(as_root: bool, terminal_type: TerminalType) -> Self {
         Node {
             state: Board::default(),
             visits: 0,
             wins: 0.0,
             is_root: as_root,
             ply: 0,
-            terminal_type: TerminalType::NONTERMINAL,
+            terminal_type: terminal_type,
             edges: RefCell::new(Vec::new()),
             edges_created: false,
             // edge_index: 0,
@@ -234,7 +259,14 @@ impl Node {
             .child_index;
         child_index
     }
-    fn push_new_child(&mut self, selected_index: usize) -> usize {
+    fn push_new_child(&mut self, selected_index: usize) {
+        self.edges
+            .borrow()
+            .get(selected_index)
+            .unwrap()
+            .as_ref()
+            .borrow_mut()
+            .solid_child = true;
         let mv = self
             .edges
             .borrow()
@@ -245,7 +277,13 @@ impl Node {
             ._move;
         self.children
             .borrow_mut()
-            .push(Rc::new(RefCell::new(Node::new(false))));
+            .push(Rc::new(RefCell::new(Node::new(false, TerminalType::LEAF))));
+        self.children
+            .borrow_mut()
+            .last()
+            .unwrap()
+            .borrow_mut()
+            .state = self.state.clone();
         self.children
             .borrow_mut()
             .last()
@@ -253,15 +291,12 @@ impl Node {
             .borrow_mut()
             .state
             .apply_move(mv);
+
         self.terminal_type = TerminalType::NONTERMINAL;
-        let s = self.children.borrow().len() - 1;
-        println!("{}", &s);
-        return s;
     }
 
-    fn simulate(&mut self, child_index: usize, side_played: &Player) -> f32 {
+    fn simulate(&mut self, side_played: &Player) -> f32 {
         //simulation
-        let kids = self.children.borrow_mut();
         // let board_pos = &mut kids.get(child_index).unwrap().borrow_mut().state;
         let board_pos = &mut self.state;
         let mut prng = rand::thread_rng();
@@ -272,7 +307,7 @@ impl Node {
             && !board_pos.stalemate()
             && !board_pos.threefold_repetition()
         {
-            board_pos.pretty_print();
+            // board_pos.pretty_print();
             let moves = board_pos.generate_moves();
             let random_index = prng.gen_range(0..moves.len());
             let random_move = moves[random_index];
@@ -300,32 +335,33 @@ impl Node {
         return result;
     }
 
-    fn select_child_uct(&self, uct: &UCT) -> (f32, usize) {
+    fn select_child_uct(&mut self, uct: &UCT) -> (f32, usize) {
+        if !self.edges_created {
+            self.create_edges(Weak::new());
+        }
         let mut biggest_ucb = 0.0;
         let mut selected_edge_index = 0;
-        if self.is_leaf() {
-            for (i, edge) in self.edges.borrow().iter().enumerate() {
-                let edge = edge.as_ref().borrow();
-                if !edge.solid_child {
-                    let qsa = 0.0;
-                    let nsa = self.visits;
-                    let ns = 1;
-                    let uct_for_node = uct.calc_uct_for_node(qsa, ns, nsa);
-                    if uct_for_node > biggest_ucb {
-                        selected_edge_index = i;
-                        biggest_ucb = uct_for_node;
-                    }
-                } else {
-                    let c = self.children.borrow();
-                    let child = c[i].as_ref().borrow();
-                    let ns = self.visits;
-                    let nsa = edge.passes;
-                    let qsa: f32 = (child.wins / nsa as f32) as f32;
-                    let uct_for_node = uct.calc_uct_for_node(qsa, ns, nsa);
-                    if uct_for_node > biggest_ucb {
-                        selected_edge_index = i;
-                        biggest_ucb = uct_for_node;
-                    }
+        for (i, edge) in self.edges.borrow().iter().enumerate() {
+            let edge = edge.as_ref().borrow();
+            if !edge.solid_child {
+                let qsa = 0.0;
+                let nsa = max(self.visits, 1);
+                let ns = 1;
+                let uct_for_node = uct.calc_uct_for_node(qsa, ns, nsa);
+                if uct_for_node > biggest_ucb {
+                    selected_edge_index = i;
+                    biggest_ucb = uct_for_node;
+                }
+            } else {
+                let c = self.children.borrow();
+                let child = c[i].as_ref().borrow();
+                let ns = self.visits;
+                let nsa = edge.passes;
+                let qsa: f32 = (child.wins / nsa as f32) as f32;
+                let uct_for_node = uct.calc_uct_for_node(qsa, ns, nsa);
+                if uct_for_node > biggest_ucb {
+                    selected_edge_index = i;
+                    biggest_ucb = uct_for_node;
                 }
             }
         }
