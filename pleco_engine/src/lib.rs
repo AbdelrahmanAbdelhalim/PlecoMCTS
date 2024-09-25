@@ -21,6 +21,8 @@ extern crate chrono;
 extern crate num_cpus;
 extern crate pleco;
 extern crate rand;
+extern crate statrs;
+extern crate csv;
 
 pub mod consts;
 pub mod engine;

@@ -53,7 +53,8 @@ pleco = { path = "../pleco", version = "0.5.0" }
 chrono = "0.4.19"
 rand = "0.8.5"
 num_cpus = "1.13.1"
-
+csv = "1"
+statrs = "0.17.1"
 [features]
 default = []
 

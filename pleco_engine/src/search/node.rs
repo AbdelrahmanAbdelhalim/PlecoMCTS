@@ -1,79 +1,62 @@
-use consts::*;
-use movepick::MovePicker;
-use pleco::board::movegen::{MoveGen, PseudoLegal};
-use pleco::core::mono_traits::QuietChecksGenType;
-use pleco::core::score::*;
-use pleco::helper::prelude::*;
-use pleco::tools::pleco_arc::Arc;
-use pleco::tools::tt::*;
-use pleco::tools::PreFetchable;
+use pleco::core::*;
 use pleco::MoveList;
-use pleco::{board, core::*};
-use pleco::{BitMove, Board, SQ};
+use pleco::{BitMove, Board};
+use rand::prelude::Distribution;
 use rand::Rng;
-use root_moves::root_moves_list::RootMoveList;
-use root_moves::RootMove;
+use statrs::distribution::Dirichlet;
 use std::borrow::Borrow;
-use std::cell::{Ref, RefCell, UnsafeCell};
-use std::cmp::{max, min};
-use std::collections::HashMap;
+use std::cell::RefCell;
 use std::fmt;
-use std::fmt::{Debug, Error, Formatter};
+use std::fmt::Debug;
 use std::mem::drop;
-use std::ops::{Deref, DerefMut};
-use std::ptr;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread::current;
-use sync::{GuardedBool, LockLatch};
-use tables::material::Material;
-use tables::pawn_table::PawnTable;
-use tables::prelude::*;
-use threadpool::threadpool;
-use time::time_management::TimeManager;
-use {MAX_PLY, THREAD_STACK_SIZE};
+use std::time::{Duration, Instant};
 
-use time::uci_timer::*;
-
-struct MctsSearcher {
+pub struct MctsSearcher {
     // search data
     board: Board,
-    nodes: AtomicU64,
     root_node: Rc<RefCell<Node>>,
     side_played: Player,
     all_nodes_visit_counts: i32,
+    tree_policy: TreePolicy,
     // nof_iterations: usize,
 }
 
 impl MctsSearcher {
-    fn new(side_played: Player) -> Self {
+    pub fn new(tree_policy: TreePolicy, side_played: Player) -> Self {
         MctsSearcher {
             board: Board::start_pos(),
-            // board: Board::from_fen("3k4/8/8/8/8/4Q3/3K4/8 w - - 0 1").unwrap(),
-            nodes: AtomicU64::new(0),
-            // root_node: Rc::new(RefCell::new(Node::new_root())),
             root_node: Rc::new(RefCell::new(Node::new_root())),
             side_played: side_played,
             all_nodes_visit_counts: 0,
+            tree_policy: tree_policy,
         }
     }
 
-    fn new_from_fen(side_played: Player, fen: &str) -> Self {
+    pub fn new_from_fen(tree_policy: TreePolicy, side_played: Player, fen: &str) -> Self {
         MctsSearcher {
             board: Board::start_pos(),
             // board: Board::from_fen("3k4/8/8/8/8/4Q3/3K4/8 w - - 0 1").unwrap(),
-            nodes: AtomicU64::new(0),
             // root_node: Rc::new(RefCell::new(Node::new_root())),
             root_node: Rc::new(RefCell::new(Node::new_from_fen(fen))),
             side_played: side_played,
             all_nodes_visit_counts: 0,
+            tree_policy: tree_policy,
         }
     }
-    fn search(&mut self) {
+    pub fn search(&mut self) -> (Vec<Vec<u16>>, Vec<String>) {
         //always start at root node.
-        let _transposition_table = TranspositionTable::new_num_entries(40000);
         let uct = &UCT::new(2f32.sqrt());
-        let mut bigg = 0;
+        // let start_time = Instant::now();
+        let mut _visits = vec![vec![
+            0;
+            self.root_node
+                .as_ref()
+                .borrow()
+                .state
+                .generate_moves()
+                .len()
+        ]];
         //Main loop for x iterations
         for _ in 0..1000 {
             let mut current_node = self.root_node.clone();
@@ -83,6 +66,7 @@ impl MctsSearcher {
             let mut stack: Vec<Rc<RefCell<Node>>> = vec![];
 
             //start selection until reaching a leaf node according to policy
+
             while !current_node.as_ref().borrow().is_leaf() || !final_leaf_ready {
                 stack.push(Rc::clone(&current_node));
 
@@ -103,20 +87,38 @@ impl MctsSearcher {
                 }
 
                 //selection
-                (_biggest_ucb, selected_edge_index) = current_node_ref.select_child_uct(&uct);
-                if current_node_ref.child_corresponding_to_edge_exists(selected_edge_index) {
-                    let child_index =
-                        current_node_ref.get_child_index_from_edge_index(selected_edge_index);
-                    let c = current_node_ref.get_child(child_index);
+                if self.tree_policy == TreePolicy::UCT {
+                    (_biggest_ucb, selected_edge_index) = current_node_ref.select_child_uct(&uct);
+                    if current_node_ref.child_corresponding_to_edge_exists(selected_edge_index) {
+                        let child_index =
+                            current_node_ref.get_child_index_from_edge_index(selected_edge_index);
+                        let c = current_node_ref.get_child(child_index);
 
-                    //drop let binding
-                    drop(current_node_ref);
-                    current_node = c;
-                    continue;
-                } else {
-                    break;
-                }
-            } //end of finding node
+                        //drop let binding
+                        drop(current_node_ref);
+                        current_node = c;
+                        continue;
+                    } else {
+                        break;
+                    }
+                }else if self.tree_policy == TreePolicy::Thompson {
+                    current_node_ref.select_child_dirilicht();
+                    if current_node_ref.child_corresponding_to_edge_exists(selected_edge_index) {
+                        let child_index =
+                            current_node_ref.get_child_index_from_edge_index(selected_edge_index);
+                        let c = current_node_ref.get_child(child_index);
+
+                        //drop let binding
+                        drop(current_node_ref);
+                        current_node = c;
+                        continue;
+                    } else {
+                        break;
+                    }
+                } //end of finding node
+            }
+            // let end_time = start_time.elapsed();
+            // println!("{:?}", end_time);
 
             //add one more node to the tree if the node is non terminal
             if !(current_node.as_ref().borrow().terminal_type == TerminalType::ENDOGFAME) {
@@ -131,14 +133,40 @@ impl MctsSearcher {
 
             //simulate
             let reward = current_node.borrow_mut().simulate(&self.side_played);
+
             //backprobagate
-            for node in stack.into_iter() {
-                node.as_ref().borrow_mut().wins += reward;
-                node.as_ref().borrow_mut().increment_visits();
+            if self.tree_policy == TreePolicy::UCT {
+                for node in stack.into_iter() {
+                    node.as_ref().borrow_mut().wins += reward;
+                    node.as_ref().borrow_mut().increment_visits();
+                }
+            } else if self.tree_policy == TreePolicy::Thompson {
+                for node in stack.into_iter() {
+                    let mut node_ref = node.as_ref().borrow_mut();
+                    node_ref.increment_visits();
+                    let alpha = node_ref.thompson_distribution.alpha();
+                    let mut new_alpha = vec![alpha[0], alpha[1], alpha[2]];
+                    if reward == 1.0 {
+                        new_alpha[0] += 1.0;
+                    } else if reward == 0.5 {
+                        new_alpha[1] += 1.0;
+                    } else if reward == 0.0 {
+                        new_alpha[2] += 1.0;
+                    }
+                    node_ref.thompson_distribution = Dirichlet::new(new_alpha).unwrap();
+                }
             }
-            let mut biggest_visits = 0;
-            let mut total_visits = 0;
-            for (i, child) in self
+
+            let mut vis = vec![
+                0;
+                self.root_node
+                    .as_ref()
+                    .borrow()
+                    .state
+                    .generate_moves()
+                    .len()
+            ];
+            for (i, node) in self
                 .root_node
                 .as_ref()
                 .borrow()
@@ -147,25 +175,18 @@ impl MctsSearcher {
                 .iter()
                 .enumerate()
             {
-                let child = child.as_ref().borrow();
-                if child.visits > biggest_visits {
-                    biggest_visits = child.visits;
-                    bigg = i;
-                }
-                total_visits += child.visits;
-                print!("{} ", child.visits);
+                let node = node.as_ref().borrow();
+                vis[i] = node.visits;
             }
-            println!("end of iteration. total visits: {}", total_visits);
-            total_visits = 0;
+            _visits.push(vis);
         }
+
+        let mut eges = vec![];
         for edge in self.root_node.as_ref().borrow().edges.borrow().iter() {
-            let edge = edge.as_ref().borrow();
-            // println!("{}", edge._move);
-            // dbg!(&edge);
-            if edge.child_index == bigg {
-                println!("top move: {}", edge._move);
-            }
+            let _mv = edge.as_ref().borrow()._move;
+            eges.push(format!("{}", _mv));
         }
+        return (_visits, eges);
     }
 
     fn set_edge_to_solid(&self, selected_edge_index: usize) {
@@ -175,12 +196,13 @@ impl MctsSearcher {
     }
 }
 
-enum TreePolicy {
-    UCT(UCT),
-    Thompson(Thompson),
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TreePolicy {
+    UCT,
+    Thompson,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct UCT {
     uct_constant: f32,
 }
@@ -198,8 +220,6 @@ impl UCT {
         return uct;
     }
 }
-
-struct Thompson {}
 
 #[derive(PartialEq, Debug, Clone)]
 #[repr(u8)]
@@ -222,6 +242,7 @@ struct Node {
     // edge_index: usize,
     pub children: RefCell<Vec<Rc<RefCell<Node>>>>,
     pub parent: RefCell<Weak<Node>>,
+    pub thompson_distribution: Dirichlet,
 }
 
 impl fmt::Debug for Node {
@@ -249,6 +270,7 @@ impl Node {
             // edge_index: 0,
             children: RefCell::new(Vec::new()),
             parent: RefCell::new(Weak::new()),
+            thompson_distribution: Dirichlet::new(vec![1.0, 1.0, 1.0]).unwrap(),
         }
     }
 
@@ -265,6 +287,7 @@ impl Node {
             // edge_index: 0,
             children: RefCell::new(Vec::new()),
             parent: RefCell::new(Weak::new()),
+            thompson_distribution: Dirichlet::new(vec![1.0, 1.0, 1.0]).unwrap(),
         }
     }
 
@@ -281,6 +304,7 @@ impl Node {
             // edge_index: 0,
             children: RefCell::new(Vec::new()),
             parent: RefCell::new(Weak::new()),
+            thompson_distribution: Dirichlet::new(vec![1.0, 1.0, 1.0]).unwrap(),
         }
     }
 
@@ -365,7 +389,7 @@ impl Node {
         let board_pos = &mut self.state;
         let mut prng = rand::thread_rng();
         let mut simulation_depth = 0;
-        let mut reward: f32 = 0.0;
+        let reward: f32;
 
         //todo: Truncate search (first optimization)
         'simloop: loop {
@@ -398,7 +422,40 @@ impl Node {
         return reward;
     }
 
+    fn select_child_dirilicht(&mut self) -> usize {
+        if !self.edges_created {
+            self.create_edges(Weak::new());
+        }
+        let mut highest_win_prob = 0.0;
+        let mut selected_edge_index = 0;
+        let mut rng = rand::thread_rng();
+        let dummy_derlicht = Dirichlet::new(vec![1.0, 1.0, 1.0]).unwrap();
+        for (i, edge) in self.edges.borrow().iter().enumerate() {
+            let edge = edge.as_ref().borrow();
+            if !edge.solid_child {
+                let sample = dummy_derlicht.sample(&mut rng);
+                let win_prob = sample[0];
+                if win_prob > highest_win_prob {
+                    highest_win_prob = win_prob;
+                    selected_edge_index = i;
+                }
+            } else {
+                let c = self.children.borrow();
+                let child_index = edge.child_index;
+                let child = c.get(child_index).unwrap().as_ref().borrow();
+                let sample = child.thompson_distribution.sample(&mut rng);
+                let win_prob = sample[0];
+                if win_prob > highest_win_prob {
+                    highest_win_prob = win_prob;
+                    selected_edge_index = i;
+                }
+            }
+        }
+        selected_edge_index
+    }
+
     fn select_child_uct(&mut self, uct: &UCT) -> (f32, usize) {
+        let start_time = Instant::now();
         if !self.edges_created {
             self.create_edges(Weak::new());
         }
@@ -426,6 +483,8 @@ impl Node {
                 }
             }
         }
+        let end_time = start_time.elapsed();
+        println!("{:?}", end_time);
         (biggest_ucb, selected_edge_index)
     }
 }
@@ -463,8 +522,40 @@ impl Edge {
 mod tests {
     use super::*;
     #[test]
-    fn create_child() {
-        let mut searcher = MctsSearcher::new(Player::White);
-        searcher.search();
+    fn search_uct() {
+        let mut searcher = MctsSearcher::new(TreePolicy::UCT, Player::White);
+        let (visits, edges) = searcher.search();
+        // dbg!(visits);
+        // dbg!(edges);
+    }
+
+    #[test]
+    fn search_thompson() {
+        let mut searcher = MctsSearcher::new(TreePolicy::Thompson, Player::White);
+        let (visits, edges) = searcher.search();
+        dbg!(visits);
+        dbg!(edges);
+    }
+    #[test]
+    fn select_child_dir() {
+        let mut searcher = MctsSearcher::new(TreePolicy::Thompson, Player::White);
+        searcher.root_node.as_ref().borrow_mut().select_child_dirilicht(); 
+    }
+
+    #[test]
+    fn select_child_uct() {
+        let mut searcher = MctsSearcher::new(TreePolicy::Thompson, Player::White);
+        let uct = UCT::new(1.0);
+        searcher.root_node.as_ref().borrow_mut().select_child_uct(&uct); 
+    }
+
+    #[test]
+    fn sample_dir() {
+        let dir = Dirichlet::new(vec![1.0,1.0,1.0]).unwrap();
+        let mut rng = rand::thread_rng();
+        let start_time = Instant::now();
+        let sample = dir.sample(&mut rng);
+        let end_time = start_time.elapsed();
+        println!("{:?}", end_time);
     }
 }

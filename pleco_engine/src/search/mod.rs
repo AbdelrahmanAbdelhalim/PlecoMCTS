@@ -1,7 +1,7 @@
 //! The main searching function.
 
 pub mod eval;
-mod node;
+pub mod node;
 
 use std::cell::UnsafeCell;
 use std::cmp::{max, min};
